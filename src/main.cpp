@@ -2,9 +2,9 @@
 #include <HX711.h>
 #include <Servo.h>
 
-const int HX711_DOUT_PIN = 2;
-const int HX711_SCK_PIN = 4;
-const int SERVO_PIN = 3;
+#define HX711_DOUT_PIN ( 2 )
+#define HX711_SCK_PIN ( 4 )
+#define SERVO_PIN ( 3 )
 
 HX711 scale;
 Servo servo;
@@ -13,21 +13,34 @@ float fMap(float x, float in_min, float in_max, float out_min, float out_max);
 
 // #define TESTING
 
+// TODO List:
+// 1. Update code: Add reading angle from pot
+//    May want to set as some kind of toy, e.g., rotation of the pot sets the set-point of the servo
+// 2. Set up hardware:
+//    1. Breadboard: Connect servo, HX711 + load cell, pot
+//    2. Mount: Should a mount of some kind be printed for this?
+// 3. Test
+//    1. Test the limToSetPoint flag
+//    2. Test the joint design (components feel secure, have full range of motion, little to no backlash)
+// 4. Update code: Add capability of measuring all 3 load cells and pots
+// 5. Print out and assemble full joint
+//      May need a mount of some kind - should be pretty solid so there's no backlash!
+
 // Set servo parameters
 // int scaleMin = 0;
 // int scaleMax = 200;
-const int SERVO_MIN = 0;
-const int SERVO_MAX = 180;
+#define SERVO_MIN ( 0 )
+#define SERVO_MAX ( 180 )
 float curJointAngle;
 
 // Force to speed conversion parameters
-const long FORCE_DIRECTION = 1;     // 1: positive force = positive angle velocity
-const float FORCE_SPEED_SCALE = 1; // g/(degree/s)
-const long FORCE_NOISE_FLOOR = 10;  // g
+#define FORCE_DIRECTION ( 1 )     // 1: positive force = positive angle velocity
+#define FORCE_SPEED_SCALE ( 1 ) // g/(degree/s)
+#define FORCE_NOISE_FLOOR ( 10 )  // g
 
 // Threshold testing parameters
-const int SERVO_SET_POINT = 90;                 // degrees
-const long THRESHOLD_FORCE = 30;                // g
+#define SERVO_SET_POINT ( 90 )                 // degrees
+#define THRESHOLD_FORCE ( 30 )                // g
 const boolean THRESHOLD_ONLY_RESISTIVE = false; // true = Servo cannot move on its own
 
 // Timing parameters
@@ -61,13 +74,15 @@ void loop()
   // Get a measurement from the load cell
   long rawInputForce = scale.get_units(1); // TODO: Get the non-blocking version of this
   long adjustedInputForce = rawInputForce;
-  if (abs(rawInputForce) < FORCE_NOISE_FLOOR)
+  if (abs(adjustedInputForce) < FORCE_NOISE_FLOOR)
   {
     adjustedInputForce = 0; // Threshold the measurement from the load cell
   }
   else
   {
-    adjustedInputForce = adjustedInputForce > 0 ? adjustedInputForce - FORCE_NOISE_FLOOR : adjustedInputForce + FORCE_NOISE_FLOOR; // TODO TESTING: Is this a good call?
+    adjustedInputForce = ( adjustedInputForce > 0 ) ? 
+      ( adjustedInputForce - FORCE_NOISE_FLOOR ) :
+      ( adjustedInputForce + FORCE_NOISE_FLOOR );
   }
 
   long controlSignal = adjustedInputForce;
@@ -79,7 +94,7 @@ void loop()
     // If the servo angle is LTE the set point, apply the threshold rules
     if (!THRESHOLD_ONLY_RESISTIVE || controlSignal < 0)
     {
-      // If the force is pushing farther down, then apply the threshold
+      // If the actuator is allowed to push back on its own OR the force is pushing farther down, then apply the threshold
       limToSetPoint = controlSignal <= 0;
       controlSignal += THRESHOLD_FORCE;
       if (THRESHOLD_ONLY_RESISTIVE)
