@@ -3,6 +3,12 @@
 #include <Servo.h>
 #include <limits.h>
 
+enum FILTERING_TYPE {
+  NO_FILTERING = 0,
+  SLIDING_WINDOW,
+  IIR_FILTERING
+};
+
 constexpr int HX711_DOUT_PIN = 2;
 constexpr int HX711_SCK_PIN = 3;
 constexpr int SERVO_PIN = 4;
@@ -29,6 +35,7 @@ constexpr float REVERSE = -1.0f;
 // 3. Test
 //    1. X Test the limToSetPoint flag
 //    2. Test the joint design (components feel secure, have full range of motion, little to no backlash)
+//    3. Check scale filter designs - sliding window adequate, or is LP IIR better?
 // 4. Update code: Add capability of measuring all 3 load cells and pots
 // 5. Print out and assemble full joint
 //      May need a mount of some kind - should be pretty solid so there's no backlash!
@@ -38,27 +45,41 @@ constexpr float SERVO_MIN_ANGLE = 0.0f;
 constexpr float SERVO_MAX_ANGLE = 180.0f;
 constexpr float SERVO_MIN_US = 500.0f;
 constexpr float SERVO_MAX_US = 2500.0f;
+constexpr float SERVO_START_POINT = 90.0f;
+constexpr float MAX_SPEED = 25.0f; // degree/s
 constexpr unsigned long SERVO_UPDATE_PERIOD_US = 0;
-static float CurJointAngle;
+static float CurJointAngle = SERVO_START_POINT;
 static float ThresholdPoint;
 static Servo servo;
 
 // Set combined force and rotation measurement parameters
-constexpr unsigned long MEASUREMENT_PERIOD_US = 40000; // Assume regular 25Hz measurements
-
+constexpr unsigned long MEASUREMENT_PERIOD_US = 100000; // Assume regular 10Hz measurements
+constexpr unsigned long START_DELAY = 2000; // Start delay, in ms
 // Set Scale parameters
-constexpr bool USE_SCALE_LOWPASS_FILTER = true; // Default - use sliding window filter
-constexpr int SCALE_IIR_LEN = 3;
-constexpr float SCALE_IIR_A0 = 4.831f;
-constexpr float SCALE_IIR_A1 = 1.789;
-constexpr float SCALE_IIR_A2 = -0.948f;
-// constexpr float SCALE_IIR_B0 = 1.0f; // Excluded for efficiency
-constexpr float SCALE_IIR_B1 = 2.0f;
-// constexpr float SCALE_IIR_B2 = 1.0f; // Excluded for efficiency
+constexpr float FORCE_SPEED_SCALE = 0.2;   // g/(degree/s)
+constexpr FILTERING_TYPE FILTERING_TO_USE = NO_FILTERING; // Default - use sliding window filter
 constexpr byte SCALE_SLIDING_WINDOW_LEN = 10;
 constexpr float SCALE_VAL_TO_GRAMS = 353.8f;
-constexpr byte NUM_TARE_READS = SCALE_SLIDING_WINDOW_LEN;
-constexpr unsigned long TARE_DEBOUNCE_US = 500000;
+constexpr byte NUM_TARE_READS = 10;
+constexpr unsigned long TARE_BUTTON_DEBOUNCE_US = 500000;
+constexpr float SCALE_ASYM_GAIN = 1.75f; // Increased relative gain for positive force compared to negative
+
+// Scale input filtering (designed using https://www.meme.net.au/butterworth.html)
+// V1: fs=25Hz, fc=5Hz
+// constexpr int SCALE_IIR_LEN = 3;
+// constexpr float SCALE_IIR_A0 = 4.831f;
+// constexpr float SCALE_IIR_A1 = 1.789f;
+// constexpr float SCALE_IIR_A2 = -0.948f;
+// // constexpr float SCALE_IIR_B0 = 1.0f; // Excluded for efficiency
+// constexpr float SCALE_IIR_B1 = 2.0f;
+// // constexpr float SCALE_IIR_B2 = 1.0f; // Excluded for efficiency
+
+// V2: fs=10Hz, fc=5Hz
+constexpr int SCALE_IIR_LEN = 2;
+// constexpr float SCALE_IIR_A0 = 1.0f;
+// constexpr float SCALE_IIR_A1 = -1.0f;
+// constexpr float SCALE_IIR_B0 = 1.0f; // Excluded for efficiency
+// constexpr float SCALE_IIR_B1 = 1.0f;
 
 // Set potentiometer parameters
 constexpr float POT_ANGLE_MIN = 0.0f; // Minimum angle of pot
@@ -70,16 +91,16 @@ constexpr float POT_EXCITE_MIN = 0.0f; // Voltage on negative terminal of pot
 constexpr float POT_EXCITE_MAX = 5.0f; // Voltage on positive terminal of pot
 
 // Scale variables, functions, and derivative parameters
-constexpr byte NUM_AVERAGED_SCALE_READS = USE_SCALE_LOWPASS_FILTER ?
-  1 : SCALE_SLIDING_WINDOW_LEN;
+constexpr byte NUM_AVERAGED_SCALE_READS = SCALE_SLIDING_WINDOW_LEN;
+constexpr byte SCALE_SIZE_BUFFER = max( NUM_AVERAGED_SCALE_READS, NUM_TARE_READS );
 constexpr int IIR_IND_1 = 0; // y0 is new output value, x0 is new input val - neither in array
-constexpr int IIR_IND_2 = 1;
+// constexpr int IIR_IND_2 = 1;
 constexpr byte ONE_SAMPLE = 1;
 static float IIRInputs[SCALE_IIR_LEN - 1] = {0.0f};
 static float IIROutputs[SCALE_IIR_LEN - 1] = {0.0f};
-static NBHX711 scale( HX711_DOUT_PIN, HX711_SCK_PIN, NUM_AVERAGED_SCALE_READS );
+static NBHX711 scale( HX711_DOUT_PIN, HX711_SCK_PIN, SCALE_SIZE_BUFFER );
 static unsigned long LastTareTime = 0;
-static float RawInputForce = 0.0f;
+static float FiltedRawInputForce = 0.0f;
 static float AdjustedInputForce = 0.0f;
 inline float forceSpeedCurve( float forceInput );
 inline float fMap( float x, float in_min, float in_max, float out_min, float out_max );
@@ -96,7 +117,7 @@ static float PotAngle = 0.0f; // Last read potentiometer angle
 
 // Force to speed conversion parameters
 constexpr int FORCE_DIRECTION = 1;     // 1: positive force = positive angle velocity
-constexpr float FORCE_SPEED_SCALE = 0.25;   // g/(degree/s)
+constexpr float MAX_SPEED_NEG = -1.0f * MAX_SPEED; // degree/s
 constexpr float FORCE_DEAD_ZONE = 20.0;  // g
 
 // Threshold testing parameters
@@ -115,7 +136,7 @@ constexpr float MICROSECONDS_TO_SECONDS =  1000000.0f; // Divide
 static unsigned long LastTime = micros( );
 
 #ifdef TESTING
-constexpr unsigned long UPDATE_CHECK_PERIOD_US = 100000;
+constexpr unsigned long UPDATE_CHECK_PERIOD_US = 300000;
 static unsigned int NumUpdates = 0;
 static unsigned int LastNumUpdates = 0;
 static unsigned long LastUpdateCheck = 0;
@@ -125,17 +146,32 @@ void setup( )
 {
 #ifdef TESTING
   Serial.begin( 9600 );
-#endif
+  Serial.print( "Starting...");
+  #endif
 
   // Initialize the HX711
   scale.begin( );
-  TareScale( );
   scale.setScale( SCALE_VAL_TO_GRAMS );
+  while ( !scale.update( ) )
+  {
+    // Wait for scale to be ready
+  }
+  #ifdef TESTING
+    Serial.println( "Scale ready!");
+  #endif
+  TareScale( );
 
   // Initialize servo
   servo = Servo( );
   servo.attach( SERVO_PIN );
+  servo.write( CurJointAngle );
   pinMode( BUTTON_PIN, INPUT_PULLUP );
+
+  // Wait for servo to settle before starting
+  delay( START_DELAY );
+  #ifdef TESTING
+    Serial.print( "Finished start-up!");
+  #endif
 }
 
 void loop( )
@@ -158,7 +194,7 @@ void loop( )
   int newTareButtonVal = digitalRead( BUTTON_PIN );
   if ( newTareButtonVal == LOW )
   {
-    if ( ( thisTime - LastTareTime ) >= TARE_DEBOUNCE_US )
+    if ( ( thisTime - LastTareTime ) >= TARE_BUTTON_DEBOUNCE_US )
     {
       TareScale( );
       LastTareTime = thisTime;
@@ -176,25 +212,40 @@ void loop( )
 
     // Measurement from scale
     scale.update( ); // TODO: If still using IIR filter, standard HX711 library is more efficient
-    if ( USE_SCALE_LOWPASS_FILTER )
+
+    float rawInputForce;
+    float scaledRawInputForce;
+    switch ( FILTERING_TO_USE )
     {
-      RawInputForce = PerformScaleLPIIRFilter( scale.getUnits( ONE_SAMPLE ) ); // TODO: Start here - check that IIR filter works!  Maybe check in MATLAB too?
-    }
-    else
-    {
-      RawInputForce = scale.getUnits( NUM_AVERAGED_SCALE_READS );
+      case SLIDING_WINDOW:
+        rawInputForce = scale.getUnits( NUM_AVERAGED_SCALE_READS );
+        FiltedRawInputForce = ( rawInputForce > 0.0f ) ?
+          ( rawInputForce * SCALE_ASYM_GAIN ) : rawInputForce; // Perform asymmetric gain
+        break;
+      case IIR_FILTERING:
+        rawInputForce = scale.getUnits( ONE_SAMPLE );
+        scaledRawInputForce = ( rawInputForce > 0.0f ) ?
+          ( rawInputForce * SCALE_ASYM_GAIN ) : rawInputForce; // Perform asymmetric gain
+        FiltedRawInputForce = PerformScaleLPIIRFilter( scaledRawInputForce ); // TODO: Start here: response is still VERY slow - check filter, try running measuremennts only when there is a new update from the scale, etc.
+        break;
+      default:
+        // No filtering
+        rawInputForce = scale.getUnits( ONE_SAMPLE );
+        FiltedRawInputForce = ( rawInputForce > 0.0f ) ?
+          ( rawInputForce * SCALE_ASYM_GAIN ) : rawInputForce; // Perform asymmetric gain
+        break;
     }
 
     // Use deadzone for scale
-    if ( abs( RawInputForce ) < FORCE_DEAD_ZONE )
+    if ( abs( FiltedRawInputForce ) < FORCE_DEAD_ZONE )
     {
       AdjustedInputForce = 0; // Threshold the measurement from the load cell
     }
     else
     {
-      AdjustedInputForce = ( RawInputForce > 0 ) ?
-        ( RawInputForce - FORCE_DEAD_ZONE ) :
-        ( RawInputForce + FORCE_DEAD_ZONE );
+      AdjustedInputForce = ( FiltedRawInputForce > 0 ) ?
+        ( FiltedRawInputForce - FORCE_DEAD_ZONE ) :
+        ( FiltedRawInputForce + FORCE_DEAD_ZONE );
     }
 
   #ifdef TESTING
@@ -254,9 +305,10 @@ void loop( )
     NumUpdates = 0;
     // Serial.println( LastNumUpdates );
     Serial.println( );
+    Serial.println( FiltedRawInputForce );
     Serial.println( controlSignal );
-    Serial.println( minAngle );
-    Serial.println( limToSetPoint );
+    Serial.println( ThresholdPoint );
+    Serial.println( dJointAngleDt );
     Serial.println( CurJointAngle );
 }
   // Write the value to the servo
@@ -271,7 +323,7 @@ inline float forceSpeedCurve( float forceInput )
 {
   // Convert the force (above a given threshold) to a speed
   // For now, try a linear relationship
-  return forceInput * FORCE_SPEED_SCALE;
+  return constrain( forceInput * FORCE_SPEED_SCALE, MAX_SPEED_NEG, MAX_SPEED );
 }
 
 inline int angleToMicroSeconds( float commandAngle )
@@ -284,18 +336,18 @@ inline int angleToMicroSeconds( float commandAngle )
 inline float PerformScaleLPIIRFilter( float newInput )
 {
   float newOutput =
-    newInput              + // * SCALE_IIR_B0 (B0 is 1.0)
-    IIRInputs [IIR_IND_1]      * SCALE_IIR_B1 +
-    IIRInputs [IIR_IND_2] + // * SCALE_IIR_B2 (B1 is 1.0)
-    IIROutputs[IIR_IND_1]      * SCALE_IIR_A1 +
-    IIROutputs[IIR_IND_2]      * SCALE_IIR_A2;
+    newInput                 + // * SCALE_IIR_B0   (B0 is 1.0)
+    IIRInputs [IIR_IND_1]    - // * SCALE_IIR_B1 + (B1 is 1.0)
+    // IIRInputs [IIR_IND_2] + // * SCALE_IIR_B2   (B2 is not defined)
+    IIROutputs[IIR_IND_1];     // * SCALE_IIR_A1 + (A1 is -1.0)
+    // IIROutputs[IIR_IND_2]      * SCALE_IIR_A2;+ (A2 is not defined)
 
-  newOutput /= SCALE_IIR_A0;
+  // newOutput /= SCALE_IIR_A0; // (A0 is 1.0)
 
   // Slide input / output queues
-  IIRInputs [IIR_IND_2] = IIRInputs [IIR_IND_1];
+  // IIRInputs [IIR_IND_2] = IIRInputs [IIR_IND_1];
   IIRInputs [IIR_IND_1] = newInput;
-  IIROutputs[IIR_IND_2] = IIROutputs[IIR_IND_1];
+  // IIROutputs[IIR_IND_2] = IIROutputs[IIR_IND_1];
   IIROutputs[IIR_IND_1] = newOutput;
 
   // Return new value
@@ -304,16 +356,41 @@ inline float PerformScaleLPIIRFilter( float newInput )
 
 void TareScale( void )
 {
+  // Note: This is a blocking function!
+  // Will block for as long as it takes to get all measurerments!
   #ifdef TESTING
   Serial.println( "Do tare!" );
+  Serial.print( "Old offset: " );
+  Serial.println( scale.getOffset( ) );
   #endif
+  digitalWrite( LED_BUILTIN, HIGH ); // Light LED to indicate TARE is active
 
+  // Perform a series of fresh updates
+  byte tareMeasurementsPerformed = 0;
+  while ( tareMeasurementsPerformed < NUM_TARE_READS )
+  {
+    if ( scale.update( ) )
+    {
+      tareMeasurementsPerformed++;
+
+      #ifdef TESTING
+      Serial.print( tareMeasurementsPerformed );
+      Serial.print( "-" );
+      #endif
+    }
+  }
+
+  // Perform the tare, and reset the filter
   scale.tare( NUM_TARE_READS );
   ResetScaleIIRFilter( );
 
   #ifdef TESTING
+  Serial.println( );
   Serial.println( "Done with tare!" );
+  Serial.print( "New offset: " );
+  Serial.println( scale.getOffset( ) );
   #endif
+  digitalWrite( LED_BUILTIN, LOW );
 }
 
 void ResetScaleIIRFilter( void )
