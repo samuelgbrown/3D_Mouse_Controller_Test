@@ -30,10 +30,12 @@ constexpr float REVERSE = -1.0f;
 // TODO List:
 // 1. X Update code: Add reading angle from pot
 //    May want to set as some kind of toy, e.g., rotation of the pot sets the set-point of the servo
-
-//    2. Test the joint design (components feel secure, have full range of motion, little to no backlash)
-//    3. Check scale filter designs - sliding window adequate, or is LP IIR better?
+// 2. Test the joint design (components feel secure, have full range of motion, little to no backlash)
+//    2.a. TODO: Need to update hardware design - replace flimsy potentiometer with more solid one
+//    2.b. Update connections - crimp dupont connectors to sensor wires
+// 3. X Check scale filter designs - sliding window adequate, or is LP IIR better?
 // 4. Update code: Add capability of measuring all 3 load cells and pots
+//    4.a Check if Arduino is fast enough to run this.  May need to try this on the RasPi Zero
 // 5. Print out and assemble full joint
 //      May need a mount of some kind - should be pretty solid so there's no backlash!
   
@@ -44,14 +46,17 @@ constexpr float SERVO_MIN_US = 500.0f;
 constexpr float SERVO_MAX_US = 2500.0f;
 constexpr float SERVO_START_POINT = 90.0f;
 constexpr float MAX_SPEED = 50.0f; // degree/s
-constexpr unsigned long SERVO_UPDATE_PERIOD_US = 40000; // 25Hz
+constexpr unsigned long SERVO_UPDATE_PERIOD_US = 25000; // 40Hz
+static int CurJointAngle_us = 0; // TESTING ONLY
 static float CurJointAngle = SERVO_START_POINT;
 static unsigned long LastServoUpdateTime = 0;
 static float ThresholdPoint;
 static Servo servo;
 
 // Set combined force and rotation measurement parameters
-constexpr unsigned long START_DELAY = 2000; // Start delay, in ms
+constexpr unsigned long START_DELAY = 1000; // Start delay, in ms
+constexpr unsigned long SENSOR_UPDATE_PERIOD_US = 25000; // 40Hz
+
 // Set Scale parameters
 constexpr float FORCE_SPEED_SCALE = 0.2;   // g/(degree/s)filter
 constexpr FILTERING_TYPE FILTERING_TO_USE = NO_FILTERING; // Default - use sliding window 
@@ -111,7 +116,7 @@ void UpdateSensors( unsigned long thisTime );
 void UpdateServo( unsigned long thisTime );
 
 // Combined force and rotation measurement variables
-unsigned long LastMeasureTime = 0;
+static unsigned long LastMeasureTime = 0;
 
 // Potentiometer variables
 static float PotAngle = 0.0f; // Last read potentiometer angle
@@ -187,9 +192,9 @@ void loop( )
     LastNumUpdates = NumUpdates;
     NumUpdates = 0;
     Serial.println( );
-    Serial.println( LastNumUpdates );
-    Serial.println( FiltedRawInputForce );
-    Serial.println( ThresholdPoint );
+    // Serial.println( LastNumUpdates );
+    Serial.println( AdjustedInputForce );
+    // Serial.println( CurJointAngle_us );
     Serial.println( CurJointAngle );
   }
   #endif
@@ -265,7 +270,8 @@ void UpdateTareCheck( unsigned long thisTime )
 void UpdateSensors( unsigned long thisTime )
 {
   // Read from potentiometer and scale
-  if ( scale.is_ready( ) )
+  if ( ( ( thisTime - LastMeasureTime ) >= SENSOR_UPDATE_PERIOD_US ) &&
+          scale.is_ready( ) )
   {
     // When new data is available from the scale (~10Hz), perform the measurement step
     // Measurement from potentiometer
@@ -288,7 +294,7 @@ void UpdateSensors( unsigned long thisTime )
         rawInputForce = scale.get_units( ONE_SAMPLE );
         scaledRawInputForce = ( rawInputForce > 0.0f ) ?
           ( rawInputForce * SCALE_ASYM_GAIN ) : rawInputForce; // Perform asymmetric gain
-        FiltedRawInputForce = PerformScaleLPIIRFilter( scaledRawInputForce ); // TODO: Start here: response is still VERY slow - check filter, try running measuremennts only when there is a new update from the scale, etc.
+        FiltedRawInputForce = PerformScaleLPIIRFilter( scaledRawInputForce );
         break;
       default:
         // No filtering
@@ -309,10 +315,10 @@ void UpdateSensors( unsigned long thisTime )
         ( FiltedRawInputForce - FORCE_DEAD_ZONE ) :
         ( FiltedRawInputForce + FORCE_DEAD_ZONE );
     }
-
-  #ifdef TESTING
+    
+    #ifdef TESTING
     ++NumUpdates;
-  #endif
+    #endif
     LastMeasureTime = thisTime;
   }
 }
@@ -378,7 +384,8 @@ void UpdateServo( unsigned long thisTime )
 
     // #ifndef TESTING
     // Write the new angle
-    servo.writeMicroseconds( angleToMicroSeconds( CurJointAngle ) );
+    CurJointAngle_us = angleToMicroSeconds( CurJointAngle );
+    servo.writeMicroseconds( CurJointAngle_us );
     // #endif
 
     LastServoUpdateTime = thisTime;
